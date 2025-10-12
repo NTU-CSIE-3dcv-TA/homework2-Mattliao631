@@ -1,0 +1,243 @@
+from scipy.spatial.transform import Rotation as R
+import open3d as o3d
+import pandas as pd
+import numpy as np
+import random
+import cv2
+import time
+
+from tqdm import tqdm
+
+np.random.seed(1428) # do not change this seed
+random.seed(1428) # do not change this seed
+
+def average(x):
+    return list(np.mean(x,axis=0))
+
+def average_desc(train_df, points3D_df):
+    train_df = train_df[["POINT_ID","XYZ","RGB","DESCRIPTORS"]]
+    desc = train_df.groupby("POINT_ID")["DESCRIPTORS"].apply(np.vstack)
+    desc = desc.apply(average)
+    desc = desc.reset_index()
+    desc = desc.join(points3D_df.set_index("POINT_ID"), on="POINT_ID")
+    return desc
+
+def pnpsolver(query, model, cameraMatrix=0, distortion=0):
+    kp_query, desc_query = query
+    kp_model, desc_model = model
+    cameraMatrix = np.array([[1868.27,0,540],[0,1869.18,960],[0,0,1]])
+    distCoeffs = np.array([0.0847023,-0.192929,-0.000201144,-0.000725352])
+
+    # Descriptor Matching using BFMatcher
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+    matches = bf.knnMatch(desc_query, desc_model, k=2)
+    
+    # Apply Lowe's ratio test to filter good matches
+    good_matches = []
+    for match_pair in matches:
+        if len(match_pair) == 2:
+            m, n = match_pair
+            if m.distance < 0.75 * n.distance:  # Ratio threshold
+                good_matches.append(m)
+    
+    # Need at least 4 points for PnP
+    if len(good_matches) < 4:
+        return None, None, None, None
+    
+    # Extract matched keypoints
+    query_pts = np.array([kp_query[m.queryIdx] for m in good_matches])
+    model_pts = np.array([kp_model[m.trainIdx] for m in good_matches])
+    
+    # Solve PnP using RANSAC for robustness
+    retval, rvec, tvec, inliers = cv2.solvePnPRansac(
+        model_pts,  # 3D points in world coordinates
+        query_pts,  # 2D points in image coordinates
+        cameraMatrix,
+        distCoeffs,
+        reprojectionError=8.0,
+        confidence=0.99,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    
+    return retval, rvec, tvec, inliers
+# def pnpsolver(query,model,cameraMatrix=0,distortion=0):
+#     kp_query, desc_query = query
+#     kp_model, desc_model = model
+#     cameraMatrix = np.array([[1868.27,0,540],[0,1869.18,960],[0,0,1]])
+#     distCoeffs = np.array([0.0847023,-0.192929,-0.000201144,-0.000725352])
+
+#     # TODO: solve PnP problem using OpenCV
+#     # Hint: you may use "Descriptors Matching and ratio test" first
+#     return None, None, None, None
+
+def rotation_error(R1, R2):
+    # R1 and R2 are quaternions in format [QX, QY, QZ, QW] or [x, y, z, w]
+    # Convert quaternions to rotation matrices
+    
+    # Handle the input format - could be 2D array with shape (1, 4) or 1D array
+    if R1.ndim == 2:
+        R1 = R1.flatten()
+    if R2.ndim == 2:
+        R2 = R2.flatten()
+    
+    # scipy expects quaternion in [x, y, z, w] format
+    # Your data has [QX, QY, QZ, QW] which is the same format
+    rot1 = R.from_quat(R1)
+    rot2 = R.from_quat(R2)
+    
+    # Calculate relative rotation: R_rel = R2^T * R1
+    # This gives us the rotation difference between the two poses
+    rot_diff = rot2.inv() * rot1
+    
+    # Convert to angle-axis representation and get the angle
+    # The magnitude of the rotation vector is the rotation angle in radians
+    rot_vec = rot_diff.as_rotvec()
+    angle_rad = np.linalg.norm(rot_vec)
+    
+    # Convert to degrees
+    angle_deg = np.rad2deg(angle_rad)
+    
+    return angle_deg
+
+# def rotation_error(R1, R2):
+#     #TODO: calculate rotation error
+#     return None
+
+def translation_error(t1, t2):
+    # Handle 2D arrays (shape (1,3)) by flattening
+    if t1.ndim == 2:
+        t1 = t1.flatten()
+    if t2.ndim == 2:
+        t2 = t2.flatten()
+    
+    # Calculate the Euclidean distance between the two translation vectors
+    return np.linalg.norm(t1 - t2)
+
+# def translation_error(t1, t2):
+#     #TODO: calculate translation error
+#     return None
+
+def visualization(Camera2World_Transform_Matrixs, points3D_df):
+    
+    # Load point cloud
+    xyz = np.vstack(points3D_df['XYZ'])
+    rgb = np.vstack(points3D_df['RGB'])/255
+    
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.colors = o3d.utility.Vector3dVector(rgb)
+    
+    # Create visualizer
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Camera Poses and Point Cloud")
+    vis.add_geometry(pcd)
+    
+    # Add coordinate axes at origin
+    axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
+    vis.add_geometry(axes)
+    
+    # Visualize each camera pose
+    for i, c2w in enumerate(Camera2World_Transform_Matrixs):
+        # Create a small coordinate frame for each camera
+        camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2, origin=[0, 0, 0])
+        camera_frame.transform(c2w)
+        vis.add_geometry(camera_frame)
+        
+        # Create a camera frustum for better visualization (optional)
+        # Extract camera position
+        camera_pos = c2w[:3, 3]
+        
+        # Create a small sphere at camera position
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        sphere.translate(camera_pos)
+        sphere.paint_uniform_color([1, 0, 0])  # Red for camera
+        vis.add_geometry(sphere)
+    
+    # Set viewing angle
+    ctr = vis.get_view_control()
+    ctr.set_zoom(0.5)
+    
+    print("\nVisualization Controls:")
+    print("- Mouse: Rotate view")
+    print("- Scroll: Zoom")
+    print("- Ctrl+Mouse: Pan")
+    print("- Q or ESC: Close window")
+    
+    vis.run()
+    vis.destroy_window()
+
+# def visualization(Camera2World_Transform_Matrixs, points3D_df):
+#     #TODO: visualize the camera pose
+#     pass
+
+
+if __name__ == "__main__":
+    # Load data
+    images_df = pd.read_pickle("data/images.pkl")
+    train_df = pd.read_pickle("data/train.pkl")
+    points3D_df = pd.read_pickle("data/points3D.pkl")
+    point_desc_df = pd.read_pickle("data/point_desc.pkl")
+
+    # Process model descriptors
+    desc_df = average_desc(train_df, points3D_df)
+    kp_model = np.array(desc_df["XYZ"].to_list())
+    desc_model = np.array(desc_df["DESCRIPTORS"].to_list()).astype(np.float32)
+
+
+    IMAGE_ID_LIST = [4,8,12,16,20]
+    r_list = []
+    t_list = []
+    rotation_error_list = []
+    translation_error_list = []
+    for idx in tqdm(IMAGE_ID_LIST):
+        # Load quaery image
+        fname = (images_df.loc[images_df["IMAGE_ID"] == idx])["NAME"].values[0]
+        rimg = cv2.imread("data/frames/" + fname, cv2.IMREAD_GRAYSCALE)
+
+        # Load query keypoints and descriptors
+        points = point_desc_df.loc[point_desc_df["IMAGE_ID"] == idx]
+        kp_query = np.array(points["XY"].to_list())
+        desc_query = np.array(points["DESCRIPTORS"].to_list()).astype(np.float32)
+
+        # Find correspondance and solve pnp
+        retval, rvec, tvec, inliers = pnpsolver((kp_query, desc_query), (kp_model, desc_model))
+        # rotq = R.from_rotvec(rvec.reshape(1,3)).as_quat() # Convert rotation vector to quaternion
+        # tvec = tvec.reshape(1,3) # Reshape translation vector
+        r_list.append(rvec)
+        t_list.append(tvec)
+
+        rotq_pred = R.from_rotvec(rvec.reshape(1,3)).as_quat() # Convert rotation vector to quaternion
+        tvec_pred = tvec.reshape(1,3) # Reshape translation vector
+
+        # Get camera pose groudtruth
+        ground_truth = images_df.loc[images_df["IMAGE_ID"]==idx]
+        rotq_gt = ground_truth[["QX","QY","QZ","QW"]].values
+        tvec_gt = ground_truth[["TX","TY","TZ"]].values
+
+        # Calculate error
+        r_error = rotation_error(rotq_pred, rotq_gt)
+        t_error = translation_error(tvec_pred, tvec_gt)
+        rotation_error_list.append(r_error)
+        translation_error_list.append(t_error)
+
+    # TODO: calculate median of relative rotation angle differences and translation differences and print them
+
+    # Calculate median of errors
+    median_rotation_error = np.median(rotation_error_list)
+    median_translation_error = np.median(translation_error_list)
+
+    print("\n" + "="*50)
+    print("POSE ESTIMATION RESULTS")
+    print("="*50)
+    print(f"Median Rotation Error: {median_rotation_error:.4f} degrees")
+    print(f"Median Translation Error: {median_translation_error:.4f} units")
+    print("="*50)
+
+    # TODO: result visualization
+    Camera2World_Transform_Matrixs = []
+    for r, t in zip(r_list, t_list):
+        # TODO: calculate camera pose in world coordinate system
+        c2w = np.eye(4)
+        Camera2World_Transform_Matrixs.append(c2w)
+    visualization(Camera2World_Transform_Matrixs, points3D_df)
+
