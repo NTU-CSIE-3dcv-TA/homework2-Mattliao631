@@ -8,7 +8,7 @@ import time
 
 from tqdm import tqdm
 
-np.random.seed(1428) # do not change this seed
+np.random.seed(148) # do not change this seed
 random.seed(1428) # do not change this seed
 
 def average(x):
@@ -184,15 +184,19 @@ if __name__ == "__main__":
     desc_model = np.array(desc_df["DESCRIPTORS"].to_list()).astype(np.float32)
 
 
-    IMAGE_ID_LIST = [4,8,12,16,20]
+    IMAGE_ID_LIST = images_df[images_df['NAME'].str.contains('valid')]['IMAGE_ID'].tolist()[:10]
+
+    print(f"Processing {len(IMAGE_ID_LIST)} validation images...")
+
     r_list = []
     t_list = []
     rotation_error_list = []
     translation_error_list = []
+
     for idx in tqdm(IMAGE_ID_LIST):
         # Load quaery image
-        fname = (images_df.loc[images_df["IMAGE_ID"] == idx])["NAME"].values[0]
-        rimg = cv2.imread("data/frames/" + fname, cv2.IMREAD_GRAYSCALE)
+        # fname = (images_df.loc[images_df["IMAGE_ID"] == idx])["NAME"].values[0]
+        # rimg = cv2.imread("data/frames/" + fname, cv2.IMREAD_GRAYSCALE)
 
         # Load query keypoints and descriptors
         points = point_desc_df.loc[point_desc_df["IMAGE_ID"] == idx]
@@ -203,6 +207,11 @@ if __name__ == "__main__":
         retval, rvec, tvec, inliers = pnpsolver((kp_query, desc_query), (kp_model, desc_model))
         # rotq = R.from_rotvec(rvec.reshape(1,3)).as_quat() # Convert rotation vector to quaternion
         # tvec = tvec.reshape(1,3) # Reshape translation vector
+
+        if not retval:
+            print(f"Warning: PnP failed for image {idx}")
+            continue
+
         r_list.append(rvec)
         t_list.append(tvec)
 
@@ -236,8 +245,27 @@ if __name__ == "__main__":
     # TODO: result visualization
     Camera2World_Transform_Matrixs = []
     for r, t in zip(r_list, t_list):
+        R_mat, _ = cv2.Rodrigues(r)
+        R_cam_to_world = R_mat.T
+        t_cam_to_world = -R_cam_to_world @ t.flatten()
         # TODO: calculate camera pose in world coordinate system
         c2w = np.eye(4)
+        c2w[:3, :3] = R_cam_to_world
+        c2w[:3, 3] = t_cam_to_world
         Camera2World_Transform_Matrixs.append(c2w)
     visualization(Camera2World_Transform_Matrixs, points3D_df)
 
+# if __name__ == "__main__":
+#     images_df = pd.read_pickle("data/images.pkl")
+#     train_df = pd.read_pickle("data/train.pkl")
+#     points3D_df = pd.read_pickle("data/points3D.pkl")
+#     point_desc_df = pd.read_pickle("data/point_desc.pkl")
+
+#     print("Images:")
+#     print(images_df.columns)
+#     print("Train:")
+#     print(train_df.columns)
+#     print("Points3D:")
+#     print(points3D_df.columns)
+#     print("Descriptors:")
+#     print(point_desc_df.columns)
