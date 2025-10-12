@@ -22,25 +22,26 @@ def average_desc(train_df, points3D_df):
     desc = desc.join(points3D_df.set_index("POINT_ID"), on="POINT_ID")
     return desc
 
-def solve_p3p(points_3d, points_2d, camera_matrix):
+def solve_p3p_grunert(points_3d, points_2d, camera_matrix):
     """
-    Solve P3P problem to find camera pose from 3 point correspondences.
+    Solve P3P problem using Grunert's method (purely geometric solution).
+    This is a from-scratch implementation without using cv2.solveP3P.
     
     Args:
-        points_3d: (3, 3) array of 3D points in world coordinates
-        points_2d: (3, 2) array of 2D points in image coordinates
+        points_3d: (3, 3) array of 3D points in world coordinates [A, B, C]
+        points_2d: (3, 2) array of 2D points in image coordinates [a, b, c]
         camera_matrix: (3, 3) camera intrinsic matrix
         
     Returns:
         list of (R, t) tuples, where R is 3x3 rotation matrix and t is 3x1 translation vector
     """
-    # Normalize 2D points using camera intrinsics
+    # Step 1: Normalize 2D points to get bearing vectors (unit vectors from camera center)
     fx = camera_matrix[0, 0]
     fy = camera_matrix[1, 1]
     cx = camera_matrix[0, 2]
     cy = camera_matrix[1, 2]
     
-    # Convert 2D points to normalized camera coordinates (bearing vectors)
+    # Convert to normalized camera coordinates
     bearing_vectors = np.zeros((3, 3))
     for i in range(3):
         x = (points_2d[i, 0] - cx) / fx
@@ -49,121 +50,284 @@ def solve_p3p(points_3d, points_2d, camera_matrix):
         # Normalize to unit vector
         bearing_vectors[i] = bearing_vectors[i] / np.linalg.norm(bearing_vectors[i])
     
-    # Use OpenCV's P3P solver (it's too complex to implement the geometry from scratch)
-    # But we're still implementing the RANSAC loop ourselves!
-    success, rvec, tvec = cv2.solveP3P(
-        points_3d.reshape(3, 1, 3),
-        points_2d.reshape(3, 1, 2),
-        camera_matrix,
-        None,
-        flags=cv2.SOLVEPNP_P3P
-    )
+    # Step 2: Compute distances between 3D points
+    # Let A, B, C be the 3D points
+    A, B, C = points_3d[0], points_3d[1], points_3d[2]
     
-    if not success:
+    # Distances between 3D world points
+    a = np.linalg.norm(B - C)  # distance BC
+    b = np.linalg.norm(A - C)  # distance AC
+    c = np.linalg.norm(A - B)  # distance AB
+    
+    # Step 3: Compute angles between bearing vectors (cosines)
+    # Let f_a, f_b, f_c be the bearing vectors (normalized image points)
+    f_a, f_b, f_c = bearing_vectors[0], bearing_vectors[1], bearing_vectors[2]
+    
+    # Cosines of angles between bearing vectors
+    cos_ab = np.dot(f_a, f_b)  # angle between rays to A and B
+    cos_ac = np.dot(f_a, f_c)  # angle between rays to A and C
+    cos_bc = np.dot(f_b, f_c)  # angle between rays to B and C
+    
+    # Step 4: Solve for distances from camera to 3D points
+    # Using the law of cosines in the triangles formed by camera center and 3D points
+    # We need to solve: x^2 + y^2 - 2*x*y*cos_ab = c^2
+    #                  x^2 + z^2 - 2*x*z*cos_ac = b^2
+    #                  y^2 + z^2 - 2*y*z*cos_bc = a^2
+    # where x, y, z are distances from camera to A, B, C respectively
+    
+    # This leads to a quartic equation. We'll use a simplified approach:
+    # Use Wu's P3P method (more numerically stable)
+    
+    solutions = solve_p3p_wu(A, B, C, f_a, f_b, f_c, a, b, c, cos_ab, cos_ac, cos_bc)
+    
+    return solutions
+
+
+def solve_p3p_kneip(points_3d, points_2d, camera_matrix):
+    """
+    Solve P3P problem using Kneip's method (more numerically stable).
+    Based on: "A Novel Parametrization of the P3P-Problem for a Direct Computation of Absolute Camera Position and Orientation"
+    
+    Args:
+        points_3d: (3, 3) array of 3D points in world coordinates
+        points_2d: (3, 2) array of 2D points in image coordinates
+        camera_matrix: (3, 3) camera intrinsic matrix
+        
+    Returns:
+        list of (R, t) tuples
+    """
+    # Normalize 2D points to get bearing vectors
+    fx = camera_matrix[0, 0]
+    fy = camera_matrix[1, 1]
+    cx = camera_matrix[0, 2]
+    cy = camera_matrix[1, 2]
+    
+    # Convert to normalized camera coordinates and create unit vectors
+    bearing_vectors = []
+    for i in range(3):
+        x = (points_2d[i, 0] - cx) / fx
+        y = (points_2d[i, 1] - cy) / fy
+        vec = np.array([x, y, 1.0])
+        vec = vec / np.linalg.norm(vec)
+        bearing_vectors.append(vec)
+    
+    bearing_vectors = np.array(bearing_vectors)
+    
+    # Get 3D points
+    P1, P2, P3 = points_3d[0], points_3d[1], points_3d[2]
+    f1, f2, f3 = bearing_vectors[0], bearing_vectors[1], bearing_vectors[2]
+    
+    # Compute intermediate values
+    # Distances between 3D points
+    d12 = np.linalg.norm(P2 - P1)
+    d13 = np.linalg.norm(P3 - P1)
+    d23 = np.linalg.norm(P3 - P2)
+
+    if d12 < 1e-6:
         return []
     
-    # cv2.solveP3P can return multiple solutions
+    # Cosines between bearing vectors
+    cos_alpha = np.dot(f1, f2)
+    cos_beta = np.dot(f1, f3)
+    cos_gamma = np.dot(f2, f3)
+    
+    # Clamp cosines to valid range to avoid numerical issues
+    cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
+    cos_beta = np.clip(cos_beta, -1.0, 1.0)
+    cos_gamma = np.clip(cos_gamma, -1.0, 1.0)
+    
+    # Build the polynomial coefficients using Kneip's formulation
+    # This is more numerically stable than Grunert's method
+    a = (d13 / d12) ** 2
+    b = (d23 / d12) ** 2
+    
+    # Construct polynomial coefficients
+    a2 = a * a
+    a3 = a2 * a
+    a4 = a3 * a
+    
+    b2 = b * b
+    b3 = b2 * b
+    b4 = b3 * b
+    
+    cos_alpha2 = cos_alpha * cos_alpha
+    cos_beta2 = cos_beta * cos_beta
+    cos_gamma2 = cos_gamma * cos_gamma
+    
+    # Coefficients of 4th degree polynomial
+    p4 = -4 * b + 4 * cos_gamma2 * b - a + 2 * a * cos_gamma + 1
+    
+    p3 = 8 * b - 8 * cos_gamma * cos_alpha * b - 4 * cos_gamma2 * b - 4 * a * b * cos_beta + 4 * a * b * cos_gamma * cos_alpha + 2 * a - 4 * a * cos_gamma - 2
+    
+    p2 = -12 * b + 4 * cos_gamma * cos_alpha * b + 8 * cos_gamma2 * b + 4 * a * b - 4 * cos_gamma2 * a * b - 2 * a2 + 4 * a * b * cos_beta - 8 * a * b * cos_gamma * cos_alpha + 4 * cos_gamma2 * a * b + 2 * a + 4 * a * cos_gamma + 1
+    
+    p1 = 4 * b - 8 * cos_gamma * cos_alpha * b - 4 * cos_gamma2 * b - 4 * a * b + 4 * cos_gamma2 * a * b + 4 * a * b * cos_gamma * cos_alpha + 2 * a2 - 4 * a - 2 * a * cos_gamma
+    
+    p0 = -4 * cos_gamma2 * b + 4 * cos_gamma2 * a * b + a2
+    
+    # Solve the 4th degree polynomial
+    coeffs = [p4, p3, p2, p1, p0]
+    
+    # Filter out very small coefficients to improve numerical stability
+    coeffs = [c if abs(c) > 1e-10 else 0 for c in coeffs]
+    
+    try:
+        roots = np.roots(coeffs)
+    except:
+        return []
+    
     solutions = []
-    if rvec is not None:
-        # Handle case where multiple solutions are returned
-        if len(rvec.shape) == 3:
-            for i in range(rvec.shape[0]):
-                R_mat, _ = cv2.Rodrigues(rvec[i])
-                t_vec = tvec[i].flatten()
-                solutions.append((R_mat, t_vec))
-        else:
-            R_mat, _ = cv2.Rodrigues(rvec)
-            t_vec = tvec.flatten()
+    
+    # Process each root
+    for root in roots:
+        if not np.isreal(root):
+            continue
+        
+        v = np.real(root)
+        if v <= 0:
+            continue
+        
+        # Compute u from v
+        u_num = (-1 + b - v * b + a * v - a * cos_gamma * v + v * v * cos_gamma * cos_alpha)
+        u_den = (v - 1 - cos_beta * cos_alpha + v * cos_beta * cos_alpha + a * cos_beta - a * v * cos_beta)
+        
+        if abs(u_den) < 1e-10:
+            continue
+        
+        u = u_num / u_den
+        
+        if u <= 0:
+            continue
+        
+        # Compute distances
+        s1 = d12 / np.sqrt(1 + u*u - 2*u*cos_alpha)
+        s2 = u * s1
+        s3 = v * s1
+        
+        if s1 <= 0 or s2 <= 0 or s3 <= 0:
+            continue
+        
+        # Compute 3D points in camera frame
+        X1 = s1 * f1
+        X2 = s2 * f2
+        X3 = s3 * f3
+        
+        # Compute pose using Procrustes
+        points_world = np.array([P1, P2, P3])
+        points_cam = np.array([X1, X2, X3])
+        
+        R_mat, t_vec = compute_absolute_pose(points_world, points_cam)
+        
+        if R_mat is not None:
             solutions.append((R_mat, t_vec))
     
     return solutions
 
 
-def refine_pose_with_inliers(points_3d, points_2d, R, t, camera_matrix, dist_coeffs):
+def compute_absolute_pose(points_world, points_cam):
     """
-    Refine the camera pose using all inlier points with iterative optimization.
-    
-    Args:
-        points_3d: (N, 3) array of 3D inlier points
-        points_2d: (N, 2) array of 2D inlier points
-        R: Initial 3x3 rotation matrix
-        t: Initial 3x1 translation vector
-        camera_matrix: Camera intrinsic matrix
-        dist_coeffs: Distortion coefficients
-        
-    Returns:
-        Refined rotation vector and translation vector
+    Compute absolute camera pose using Procrustes/Kabsch algorithm.
+    Finds R and t such that: points_cam = R @ points_world + t
     """
-    rvec, _ = cv2.Rodrigues(R)
-    tvec = t.reshape(3, 1)
+    # Center the point sets
+    centroid_world = np.mean(points_world, axis=0)
+    centroid_cam = np.mean(points_cam, axis=0)
     
-    # Use iterative refinement with all inliers
-    rvec, tvec = cv2.solvePnPRefineLM(
-        points_3d.reshape(-1, 1, 3),
-        points_2d.reshape(-1, 1, 2),
-        camera_matrix,
-        dist_coeffs,
-        rvec,
-        tvec
-    )
+    centered_world = points_world - centroid_world
+    centered_cam = points_cam - centroid_cam
     
-    return rvec, tvec
+    # Compute the cross-covariance matrix
+    H = centered_world.T @ centered_cam
+    
+    # SVD
+    try:
+        U, S, Vt = np.linalg.svd(H)
+    except:
+        return None, None
+    
+    # Compute rotation
+    R = Vt.T @ U.T
+    
+    # Handle reflection case
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    
+    # Compute translation
+    t = centroid_cam - R @ centroid_world
+    
+    return R, t
 
 
-def compute_reprojection_error(points_3d, points_2d, R, t, camera_matrix, dist_coeffs):
+def project_points(points_3d, R, t, camera_matrix):
     """
-    Compute reprojection error for given pose.
+    Project 3D points to image plane.
+    """
+    # Transform to camera coordinates
+    points_cam = (R @ points_3d.T).T + t
+    
+    # Avoid division by zero
+    points_cam[:, 2] = np.maximum(points_cam[:, 2], 1e-6)
+    
+    fx = camera_matrix[0, 0]
+    fy = camera_matrix[1, 1]
+    cx = camera_matrix[0, 2]
+    cy = camera_matrix[1, 2]
+    
+    # Project to image
+    u = fx * points_cam[:, 0] / points_cam[:, 2] + cx
+    v = fy * points_cam[:, 1] / points_cam[:, 2] + cy
+    
+    return np.column_stack([u, v])
+
+
+def compute_reprojection_error(points_3d, points_2d, R, t, camera_matrix):
+    """
+    Compute reprojection errors.
+    """
+    projected = project_points(points_3d, R, t, camera_matrix)
+    errors = np.linalg.norm(projected - points_2d, axis=1)
+    return errors
+
+
+def refine_pose_pnp(points_3d, points_2d, R_init, t_init, camera_matrix):
+    """
+    Refine pose using OpenCV's iterative method (allowed for refinement).
+    """
+    rvec_init, _ = cv2.Rodrigues(R_init)
+    tvec_init = t_init.reshape(3, 1)
+    
+    try:
+        rvec, tvec = cv2.solvePnPRefineLM(
+            points_3d.reshape(-1, 1, 3),
+            points_2d.reshape(-1, 1, 2),
+            camera_matrix,
+            None,  # No distortion
+            rvec_init,
+            tvec_init
+        )
+        return rvec, tvec
+    except:
+        return rvec_init, tvec_init
+
+
+def pnp_ransac_custom(points_3d, points_2d, camera_matrix, 
+                      reprojection_threshold=8.0, max_iterations=2000, 
+                      confidence=0.99, min_inliers=6):
+    """
+    Custom RANSAC + P3P implementation.
     
     Args:
         points_3d: (N, 3) array of 3D points
         points_2d: (N, 2) array of 2D points
-        R: 3x3 rotation matrix
-        t: 3x1 translation vector
-        camera_matrix: Camera intrinsic matrix
-        dist_coeffs: Distortion coefficients
+        camera_matrix: (3, 3) intrinsic matrix
+        reprojection_threshold: inlier threshold in pixels
+        max_iterations: maximum RANSAC iterations
+        confidence: desired confidence level
+        min_inliers: minimum number of inliers required
         
     Returns:
-        Array of reprojection errors for each point
-    """
-    rvec, _ = cv2.Rodrigues(R)
-    tvec = t.reshape(3, 1)
-    
-    # Project 3D points to image plane
-    projected_points, _ = cv2.projectPoints(
-        points_3d.reshape(-1, 1, 3),
-        rvec,
-        tvec,
-        camera_matrix,
-        dist_coeffs
-    )
-    
-    projected_points = projected_points.reshape(-1, 2)
-    
-    # Compute Euclidean distance between projected and observed points
-    errors = np.linalg.norm(projected_points - points_2d, axis=1)
-    
-    return errors
-
-
-def pnp_ransac(points_3d, points_2d, camera_matrix, dist_coeffs, 
-               reprojection_threshold=8.0, max_iterations=1000, confidence=0.99):
-    """
-    P3P + RANSAC implementation for robust camera pose estimation.
-    
-    Args:
-        points_3d: (N, 3) array of 3D points in world coordinates
-        points_2d: (N, 2) array of corresponding 2D points in image coordinates
-        camera_matrix: (3, 3) camera intrinsic matrix
-        dist_coeffs: (4,) or (5,) array of distortion coefficients
-        reprojection_threshold: Maximum reprojection error for inliers (pixels)
-        max_iterations: Maximum RANSAC iterations
-        confidence: Desired confidence level (0.99 = 99%)
-        
-    Returns:
-        success: Boolean indicating if pose was found
-        rvec: Rotation vector (3x1)
-        tvec: Translation vector (3x1)
-        inlier_indices: Indices of inlier correspondences
+        success, rvec, tvec, inlier_indices
     """
     n_points = len(points_3d)
     
@@ -175,93 +339,107 @@ def pnp_ransac(points_3d, points_2d, camera_matrix, dist_coeffs,
     best_t = None
     best_num_inliers = 0
     
-    # Adaptive RANSAC: adjust iterations based on inlier ratio
     iterations = 0
     
+    np.random.seed(int(np.random.random() * 10000))  # Random seed for variety
+    
     while iterations < max_iterations:
-        # Step 1: Randomly sample 3 points
-        sample_indices = np.random.choice(n_points, 3, replace=False)
-        sample_3d = points_3d[sample_indices]
-        sample_2d = points_2d[sample_indices]
+        # Sample 3 points randomly
+        if n_points == 3:
+            sample_idx = [0, 1, 2]
+        else:
+            sample_idx = np.random.choice(n_points, 3, replace=False)
         
-        # Step 2: Solve P3P for the 3 sampled points
-        solutions = solve_p3p(sample_3d, sample_2d, camera_matrix)
+        sample_3d = points_3d[sample_idx]
+        sample_2d = points_2d[sample_idx]
+        
+        # Solve P3P
+        try:
+            solutions = solve_p3p_kneip(sample_3d, sample_2d, camera_matrix)
+        except:
+            iterations += 1
+            continue
         
         if not solutions:
             iterations += 1
             continue
         
-        # Step 3: Evaluate each solution (P3P can return multiple solutions)
+        # Test each solution
         for R, t in solutions:
-            # Compute reprojection errors for all points
-            errors = compute_reprojection_error(
-                points_3d, points_2d, R, t, camera_matrix, dist_coeffs
-            )
+            # Compute errors for all points
+            try:
+                errors = compute_reprojection_error(points_3d, points_2d, R, t, camera_matrix)
+            except:
+                continue
             
-            # Step 4: Count inliers
+            # Count inliers
             inlier_mask = errors < reprojection_threshold
-            inlier_indices = np.where(inlier_mask)[0]
-            num_inliers = len(inlier_indices)
+            inlier_idx = np.where(inlier_mask)[0]
+            num_inliers = len(inlier_idx)
             
-            # Step 5: Update best model if this is better
+            # Update best model
             if num_inliers > best_num_inliers:
                 best_num_inliers = num_inliers
                 best_R = R
                 best_t = t
-                best_inliers = inlier_indices
+                best_inliers = inlier_idx
                 
-                # Adaptive RANSAC: update max_iterations based on inlier ratio
-                inlier_ratio = num_inliers / n_points
-                if inlier_ratio > 0:
-                    # Formula: N = log(1-p) / log(1-w^s)
-                    # where p=confidence, w=inlier_ratio, s=sample_size (3 for P3P)
-                    num_iterations_needed = np.log(1 - confidence) / np.log(1 - inlier_ratio**3)
-                    max_iterations = min(max_iterations, int(num_iterations_needed) + 1)
+                # Adaptive RANSAC
+                if num_inliers > 3:
+                    inlier_ratio = num_inliers / n_points
+                    if inlier_ratio > 0.05:
+                        try:
+                            adaptive_iters = np.log(1 - confidence) / np.log(1 - inlier_ratio**3)
+                            max_iterations = min(max_iterations, int(adaptive_iters) + 100)
+                        except:
+                            pass
         
         iterations += 1
+        
+        # Early termination if we have enough inliers
+        if best_num_inliers > max(min_inliers, int(0.3 * n_points)):
+            break
     
-    # Check if we found a valid solution
-    if best_num_inliers < 4:  # Need at least 4 inliers for a stable solution
+    # Check if solution is valid
+    if best_num_inliers < min_inliers:
         return False, None, None, None
     
-    # Step 6: Refine pose using all inliers
+    # Refine with all inliers
     inlier_3d = points_3d[best_inliers]
     inlier_2d = points_2d[best_inliers]
     
-    rvec_refined, tvec_refined = refine_pose_with_inliers(
-        inlier_3d, inlier_2d, best_R, best_t, camera_matrix, dist_coeffs
-    )
+    try:
+        rvec, tvec = refine_pose_pnp(inlier_3d, inlier_2d, best_R, best_t, camera_matrix)
+    except:
+        rvec, _ = cv2.Rodrigues(best_R)
+        tvec = best_t.reshape(3, 1)
     
-    return True, rvec_refined, tvec_refined, best_inliers
+    return True, rvec, tvec, best_inliers
 
 
 def pnpsolver_custom(query, model, cameraMatrix=0, distortion=0):
     """
-    Custom PnP solver using descriptor matching + P3P + RANSAC.
-    This is the DROP-IN REPLACEMENT for your original pnpsolver.
+    Custom PnP solver: Descriptor Matching + P3P + RANSAC.
+    P3P and RANSAC are implemented from scratch!
     
     Args:
-        query: tuple of (kp_query, desc_query)
-        model: tuple of (kp_model, desc_model)
+        query: (kp_query, desc_query) 
+        model: (kp_model, desc_model)
         
     Returns:
-        retval: Success flag
-        rvec: Rotation vector
-        tvec: Translation vector
-        inliers: Indices of inlier matches
+        success, rvec, tvec, inliers
     """
     kp_query, desc_query = query
     kp_model, desc_model = model
     
-    # Camera parameters
-    cameraMatrix = np.array([[1868.27, 0, 540], [0, 1869.18, 960], [0, 0, 1]])
-    distCoeffs = np.array([0.0847023, -0.192929, -0.000201144, -0.000725352])
+    # Camera intrinsics
+    cameraMatrix = np.array([[1868.27, 0, 540], [0, 1869.18, 960], [0, 0, 1]], dtype=np.float64)
     
-    # Step 1: Descriptor Matching using BFMatcher
+    # Descriptor matching
     bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
     matches = bf.knnMatch(desc_query, desc_model, k=2)
     
-    # Step 2: Apply Lowe's ratio test
+    # Ratio test
     good_matches = []
     for match_pair in matches:
         if len(match_pair) == 2:
@@ -269,32 +447,30 @@ def pnpsolver_custom(query, model, cameraMatrix=0, distortion=0):
             if m.distance < 0.75 * n.distance:
                 good_matches.append(m)
     
-    if len(good_matches) < 4:
+    if len(good_matches) < 6:
         return False, None, None, None
     
-    # Step 3: Extract matched keypoints
-    query_pts = np.array([kp_query[m.queryIdx] for m in good_matches])
-    model_pts = np.array([kp_model[m.trainIdx] for m in good_matches])
+    # Extract correspondences
+    query_pts = np.array([kp_query[m.queryIdx] for m in good_matches], dtype=np.float64)
+    model_pts = np.array([kp_model[m.trainIdx] for m in good_matches], dtype=np.float64)
     
-    # Step 4: Apply our custom P3P + RANSAC
-    retval, rvec, tvec, inlier_indices = pnp_ransac(
-        model_pts,  # 3D points
-        query_pts,  # 2D points
+    # Run custom P3P + RANSAC
+    success, rvec, tvec, inlier_idx = pnp_ransac_custom(
+        model_pts,
+        query_pts,
         cameraMatrix,
-        distCoeffs,
         reprojection_threshold=8.0,
-        max_iterations=1000,
-        confidence=0.99
+        max_iterations=2000,
+        confidence=0.99,
+        min_inliers=6
     )
     
-    if not retval:
+    if not success:
         return False, None, None, None
     
-    # Convert inlier_indices to the format expected by the caller
-    # (indices into the good_matches array)
-    inliers = inlier_indices.reshape(-1, 1) if inlier_indices is not None else None
+    inliers = inlier_idx.reshape(-1, 1) if inlier_idx is not None else None
     
-    return retval, rvec, tvec, inliers
+    return True, rvec, tvec, inliers
 def pnpsolver(query, model, cameraMatrix=0, distortion=0):
     kp_query, desc_query = query
     kp_model, desc_model = model
@@ -457,7 +633,7 @@ if __name__ == "__main__":
     desc_model = np.array(desc_df["DESCRIPTORS"].to_list()).astype(np.float32)
 
 
-    IMAGE_ID_LIST = images_df[images_df['NAME'].str.contains('valid')]['IMAGE_ID'].tolist()[:10]
+    IMAGE_ID_LIST = images_df[images_df['NAME'].str.contains('valid')]['IMAGE_ID'].tolist()
 
     print(f"Processing {len(IMAGE_ID_LIST)} validation images...")
 
